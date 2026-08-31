@@ -1,8 +1,8 @@
 # MCTier 信令服务器 Docker 镜像
 # 基于 Rust 官方镜像构建
 
-# 构建阶段
-FROM rust:1.83-slim as builder
+# 构建阶段 - 使用 Rust 1.85 或更高版本以支持 edition2024 依赖
+FROM rust:1.85-slim as builder
 
 # 安装必要的构建工具
 RUN apt-get update && apt-get install -y \
