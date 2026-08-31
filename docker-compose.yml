@@ -1,4 +1,4 @@
-services:
+﻿services:
   # MCTier 信令服务器
   #
   # 本文件只负责信令容器本身。反向代理与 TLS 证书由部署者在宿主机自行处理
@@ -10,13 +10,10 @@ services:
       dockerfile: Dockerfile
     container_name: mctier-signaling
     restart: unless-stopped
-    # 默认只绑定回环地址，由宿主机上的反向代理转发过来。
-    # 这样即使忘了配 TLS，未加密的 WS 也不会直接暴露在公网。
-    #
-    # 如果确实要让容器直接对外提供服务（例如内网测试、或纯 IP 无域名部署），
-    # 把下面一行改成 "8445:8445"，并自行确保链路安全。
+    # 端口映射：直接暴露 8445 端口
+    # 部署者需自行配置反向代理（nginx/caddy）和 TLS 证书
     ports:
-      - "127.0.0.1:8445:8445"
+      - "8445:8445"
     environment:
       - RUST_LOG=${RUST_LOG:-info}
       - BIND_ADDRESS=0.0.0.0:8445
