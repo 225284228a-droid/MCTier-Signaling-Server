@@ -380,6 +380,16 @@ pub enum SignalingMessage {
         downstream_id: Option<String>,
         #[serde(rename = "routeVersion", skip_serializing_if = "Option::is_none")]
         route_version: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+        #[serde(rename = "sourceSequence", skip_serializing_if = "Option::is_none")]
+        source_sequence: Option<u64>,
+        #[serde(rename = "sentSequence", skip_serializing_if = "Option::is_none")]
+        sent_sequence: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limited: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// 屏幕共享 Offer
     #[serde(rename = "screen-share-offer")]
@@ -1258,6 +1268,10 @@ fn validate_message_shape(message: &SignalingMessage) -> bool {
             password,
             upstream_id,
             downstream_id,
+            sequence,
+            source_sequence,
+            sent_sequence,
+            reason,
             ..
         } => {
             ids(from, to)
@@ -1267,6 +1281,9 @@ fn validate_message_shape(message: &SignalingMessage) -> bool {
                 && optional_control(password.as_ref(), MAX_CONTROL_TEXT_LEN)
                 && optional_control(upstream_id.as_ref(), MAX_CLIENT_ID_LEN)
                 && optional_control(downstream_id.as_ref(), MAX_CLIENT_ID_LEN)
+                && optional_control(reason.as_ref(), 256)
+                && [sequence, source_sequence, sent_sequence]
+                    .iter().all(|value| value.is_none_or(|n| n <= 1_000_000_000))
         }
         SignalingMessage::ScreenShareOffer {
             from,
@@ -2848,8 +2865,16 @@ async fn handle_connection_with_timeouts_and_limits(
 
                                     // 获取或创建大厅
                                     let mut lobbies_write = lobbies.write().await;
-                                    if lobbies_write.values().any(|existing_lobby| {
-                                        existing_lobby.clients.contains_key(&cid)
+                                    let existing_client_lobby = lobbies_write
+                                        .iter()
+                                        .find_map(|(existing_lid, existing_lobby)| {
+                                            existing_lobby
+                                                .clients
+                                                .contains_key(&cid)
+                                                .then(|| existing_lid.clone())
+                                        });
+                                    if existing_client_lobby.as_deref().is_some_and(|existing_lid| {
+                                        existing_lid != lid
                                     }) {
                                         log::warn!(
                                             "拒绝重复 clientId 注册: {} ({})",
@@ -2913,11 +2938,17 @@ async fn handle_connection_with_timeouts_and_limits(
 
                                     // Virtual IP is the identity binding used by the chat HTTP
                                     // service. Do not allow two members to claim the same address.
+                                    // A reconnect of the same signed identity must replace its
+                                    // stale websocket session. Checking the old record as a
+                                    // competing owner rejects every reconnect with
+                                    // "virtualIp already in use" and leaves the old HTTP/chat
+                                    // credentials bound to a dead connection.
                                     if lobby.clients.values().any(|info| {
-                                        info.virtual_ip
-                                            .as_deref()
-                                            .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
-                                            == Some(virtual_ip)
+                                        info.player_id != cid
+                                            && info.virtual_ip
+                                                .as_deref()
+                                                .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
+                                                == Some(virtual_ip)
                                     }) {
                                         log::warn!(
                                             "❌ 虚拟IP已在大厅 {} 中使用: {}",
@@ -2983,6 +3014,12 @@ async fn handle_connection_with_timeouts_and_limits(
                                     // token；新成员从 register-success 获得新 token，旧成员只
                                     // 通过各自已认证的 WebSocket 会话收到轮换事件。
                                     let had_existing_members = !lobby.clients.is_empty();
+                                    if let Some(previous) = lobby.clients.get(&cid) {
+                                        // Explicitly terminate the stale transport. Its delayed
+                                        // cleanup is generation/sender guarded below, so it cannot
+                                        // remove the replacement session.
+                                        let _ = previous.disconnect.send(true);
+                                    }
                                     lobby.clients.insert(cid.clone(), client_info);
                                     let (chat_token_now, chat_token_epoch_now) =
                                         if had_existing_members {
@@ -3402,6 +3439,11 @@ async fn handle_connection_with_timeouts_and_limits(
                                     upstream_id,
                                     downstream_id,
                                     route_version,
+                                    sequence,
+                                    source_sequence,
+                                    sent_sequence,
+                                    limited,
+                                    reason,
                                 } => {
                                     if !is_registered {
                                         log::warn!(
@@ -3433,6 +3475,11 @@ async fn handle_connection_with_timeouts_and_limits(
                                         upstream_id,
                                         downstream_id,
                                         route_version,
+                                        sequence,
+                                        source_sequence,
+                                        sent_sequence,
+                                        limited,
+                                        reason,
                                     };
                                     if let Ok(json) = serde_json::to_string(&forward_msg) {
                                         if !send_to_lobby_client(
@@ -4893,6 +4940,51 @@ mod tests {
         assert_eq!(config.max_frame_size, Some(256 * 1024));
     }
 
+    #[test]
+    fn screen_health_survives_signal_serialization() {
+        let wire = serde_json::json!({
+            "type": "screen-share-relay", "from": "android", "to": "desktop",
+            "shareId": "share-android-1800000000000", "action": "health", "routeVersion": 1,
+            "sequence": 53, "sourceSequence": 53, "sentSequence": 49, "limited": false,
+            "reason": "stalled"
+        });
+        let message: SignalingMessage = serde_json::from_value(wire.clone()).unwrap();
+        assert!(validate_message_shape(&message));
+        let forwarded = serde_json::to_value(message).unwrap();
+        assert_eq!(forwarded, wire);
+        let mut invalid = wire;
+        invalid["sourceSequence"] = serde_json::json!(1_000_000_001u64);
+        assert!(!validate_message_shape(&serde_json::from_value(invalid).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn screen_health_reaches_authenticated_viewer_intact() {
+        let (address, server) = spawn_test_server().await;
+        let url = format!("ws://{address}");
+        let (mut publisher, _) = connect_async(&url).await.unwrap();
+        let registered = register(&mut publisher, "phone", "screen-room").await;
+        let (mut viewer, _) = connect_async(&url).await.unwrap();
+        register(&mut viewer, "desktop", "screen-room").await;
+        assert_eq!(next_json(&mut publisher).await["type"], "chat-token-rotated");
+        assert_eq!(next_json(&mut publisher).await["type"], "player-joined");
+        let (_, _, publisher_id) = test_identity_key("phone");
+        let (_, _, viewer_id) = test_identity_key("desktop");
+        let health = serde_json::json!({
+            "type": "screen-share-relay", "from": publisher_id, "to": viewer_id,
+            "shareId": format!("share-{publisher_id}-1800000000000"),
+            "action": "health", "routeVersion": 1,
+            "sequence": 53, "sourceSequence": 53, "sentSequence": 49, "limited": false,
+            "reason": "stalled"
+        });
+        publisher.send(Message::Text(health.to_string())).await.unwrap();
+        let received = next_json(&mut viewer).await;
+        for (key, value) in health.as_object().unwrap() {
+            assert_eq!(&received[key], value, "forwarded field {key}");
+        }
+        assert_eq!(received["sessionGeneration"], registered["sessionGeneration"]);
+        server.abort();
+    }
+
     /// 测试用客户端版本：直接取当前门槛值，避免写死字面量。
     /// 此前各处硬编码 "2.1.0" / "2.7.5"，门槛一提高就会有一批测试因为
     /// 「版本过低」集体失败，而失败原因与被测逻辑无关，属于噪音。
@@ -5778,7 +5870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_client_id_is_rejected_without_replacing_existing_session() {
+    async fn same_client_id_reconnect_replaces_existing_session() {
         let (address, server) = spawn_test_server().await;
         let url = format!("ws://{address}");
         let (mut first, _) = connect_async(&url).await.unwrap();
@@ -5793,22 +5885,15 @@ mod tests {
             &test_virtual_ip("same-id"),
         )
         .await;
-        assert_eq!(next_json(&mut duplicate).await["type"], "register-error");
-        match timeout(Duration::from_secs(2), duplicate.next())
+        assert_eq!(next_json(&mut duplicate).await["type"], "register-success");
+        assert_eq!(next_json(&mut duplicate).await["type"], "players-list");
+        match timeout(Duration::from_secs(2), first.next())
             .await
             .unwrap()
         {
             None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
-            Some(Ok(message)) => panic!("duplicate session stayed open with {message:?}"),
+            Some(Ok(message)) => panic!("stale session stayed open with {message:?}"),
         }
-
-        first
-            .send(Message::Text(
-                serde_json::json!({"type":"ping"}).to_string(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(next_json(&mut first).await["type"], "pong");
 
         server.abort();
     }
