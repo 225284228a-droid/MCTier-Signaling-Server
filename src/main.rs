@@ -54,7 +54,6 @@ const MAX_ICE_CANDIDATE_LEN: usize = 16 * 1024;
 const MAX_CONTROL_TEXT_LEN: usize = 8 * 1024;
 const MAX_MESSAGES_PER_WINDOW: u32 = 120;
 const MESSAGE_RATE_WINDOW_SECS: u64 = 10;
-const MAX_TRACKED_IP_MESSAGE_LIMITERS: usize = 8192;
 const MAX_OUTBOUND_FRAMES_PER_WINDOW: u32 = 64;
 const MAX_OUTBOUND_BYTES_PER_WINDOW: usize = 1024 * 1024;
 const OUTBOUND_BUDGET_WINDOW_SECS: u64 = 1;
@@ -878,7 +877,6 @@ fn allow_submit_quota(quota: &mut SubmitQuota) -> bool {
 
 type SubmitQuotas = Arc<Mutex<HashMap<std::net::IpAddr, SubmitQuota>>>;
 type ProbeLimiter = Arc<Semaphore>;
-type IpMessageLimiters = Arc<Mutex<HashMap<std::net::IpAddr, MessageRateLimiter>>>;
 
 #[derive(Debug)]
 struct OutboundBudget {
@@ -943,21 +941,6 @@ fn connection_limit_from_env(value: Option<&str>) -> usize {
 
 fn max_connections() -> usize {
     connection_limit_from_env(std::env::var("MAX_CONNECTIONS").ok().as_deref())
-}
-
-async fn allow_ip_message(limiters: &IpMessageLimiters, ip: std::net::IpAddr) -> bool {
-    let mut limiters = limiters.lock().await;
-    limiters.retain(|_, limiter| {
-        limiter.window_started.elapsed()
-            < tokio::time::Duration::from_secs(MESSAGE_RATE_WINDOW_SECS * 2)
-    });
-    if !limiters.contains_key(&ip) && limiters.len() >= MAX_TRACKED_IP_MESSAGE_LIMITERS {
-        return false;
-    }
-    limiters
-        .entry(ip)
-        .or_insert_with(MessageRateLimiter::new)
-        .allow()
 }
 
 const CHAT_TOKEN_BYTES: usize = 32;
@@ -2331,7 +2314,6 @@ async fn main() {
     let max_connections = max_connections();
     log::info!("最大并发连接数: {}", max_connections);
     let connection_semaphore = Arc::new(Semaphore::new(max_connections));
-    let ip_message_limiters: IpMessageLimiters = Arc::new(Mutex::new(HashMap::new()));
 
     // 创建大厅列表和客户端映射
     let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
@@ -2390,7 +2372,6 @@ async fn main() {
                 let submit_cooldowns_clone = Arc::clone(&submit_cooldowns);
                 let submit_quotas_clone = Arc::clone(&submit_quotas);
                 let probe_limiter_clone = Arc::clone(&probe_limiter);
-                let ip_message_limiters_clone = Arc::clone(&ip_message_limiters);
 
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
@@ -2403,7 +2384,6 @@ async fn main() {
                         submit_cooldowns_clone,
                         submit_quotas_clone,
                         probe_limiter_clone,
-                        ip_message_limiters_clone,
                     )
                     .await
                     {
@@ -2430,7 +2410,6 @@ async fn handle_connection(
     submit_cooldowns: SubmitCooldowns,
     submit_quotas: SubmitQuotas,
     probe_limiter: ProbeLimiter,
-    ip_message_limiters: IpMessageLimiters,
 ) -> Result<(), Box<dyn std::error::Error>> {
     handle_connection_with_timeouts_and_limits(
         stream,
@@ -2441,7 +2420,6 @@ async fn handle_connection(
         submit_cooldowns,
         submit_quotas,
         probe_limiter,
-        ip_message_limiters,
         tokio::time::Duration::from_secs(WEBSOCKET_HANDSHAKE_TIMEOUT_SECS),
         tokio::time::Duration::from_secs(REGISTRATION_TIMEOUT_SECS),
         tokio::time::Duration::from_secs(REGISTERED_IDLE_TIMEOUT_SECS),
@@ -2471,7 +2449,6 @@ async fn handle_connection_with_timeouts(
         submit_cooldowns,
         Arc::new(Mutex::new(HashMap::new())),
         Arc::new(Semaphore::new(COMMUNITY_NODE_PROBE_CONCURRENCY)),
-        Arc::new(Mutex::new(HashMap::new())),
         handshake_timeout,
         registration_timeout,
         idle_timeout,
@@ -2489,7 +2466,6 @@ async fn handle_connection_with_timeouts_and_limits(
     submit_cooldowns: SubmitCooldowns,
     submit_quotas: SubmitQuotas,
     probe_limiter: ProbeLimiter,
-    ip_message_limiters: IpMessageLimiters,
     handshake_timeout: tokio::time::Duration,
     registration_timeout: tokio::time::Duration,
     idle_timeout: tokio::time::Duration,
@@ -2581,10 +2557,10 @@ async fn handle_connection_with_timeouts_and_limits(
 
         match msg_result {
             Ok(msg) => {
-                if !connection_rate_limiter.allow()
-                    || !allow_ip_message(&ip_message_limiters, addr.ip()).await
-                {
-                    log::warn!("连接或来源地址消息速率超限，关闭连接: {}", addr);
+                // TCP peers behind a reverse proxy share one address. Give each
+                // bounded connection its own budget so users cannot evict peers.
+                if !connection_rate_limiter.allow() {
+                    log::warn!("连接消息速率超限，关闭连接: {}", addr);
                     let _ = send_message(&write, Message::Close(None)).await;
                     break;
                 }
@@ -2637,10 +2613,22 @@ async fn handle_connection_with_timeouts_and_limits(
                             }
 
                             match message {
-                                SignalingMessage::Register { .. } => {
-                                    let error_msg = SignalingMessage::RegisterError {
-                                        message: "已拒绝旧注册协议，请先等待 server-challenge 后使用 register-v3"
-                                            .to_string(),
+                                SignalingMessage::Register { client_version, .. } => {
+                                    // Old clients show the upgrade screen only for version-too-old.
+                                    // Reject here without admitting a legacy identity to the lobby.
+                                    let version_str = client_version.as_deref().unwrap_or("unknown");
+                                    let error_msg = if !is_version_valid(version_str, minimum_client_version()) {
+                                        SignalingMessage::VersionTooOld {
+                                            message: format!("您的客户端版本过低（当前版本: {}），请更新到最新版本（最低要求: {}）", version_str, minimum_client_version()),
+                                            current_version: version_str.to_string(),
+                                            minimum_version: minimum_client_version().to_string(),
+                                            download_url: client_download_url().to_string(),
+                                        }
+                                    } else {
+                                        SignalingMessage::RegisterError {
+                                            message: "已拒绝旧注册协议，请先等待 server-challenge 后使用 register-v3"
+                                                .to_string(),
+                                        }
                                     };
                                     if let Ok(json) = serde_json::to_string(&error_msg) {
                                         send_text(&write, json).await;
@@ -5156,6 +5144,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_register_old_versions_receive_upgrade_error_and_disconnect() {
+        for version in [Some("2.7.5"), Some("2.9.99"), None] {
+            let (address, server_task) =
+                start_connection_server(tokio::time::Duration::from_secs(1)).await;
+            let (mut client, _) = connect_async(format!("ws://{address}"))
+                .await
+                .expect("WebSocket handshake should succeed");
+            // v2.7.5 registers immediately and ignores the server challenge.
+            let mut registration = serde_json::json!({
+                "type": "register", "clientId": "legacy", "playerName": "Legacy",
+                "virtualIp": "10.126.126.10", "lobbyName": "room", "lobbyPassword": "password"
+            });
+            if let Some(version) = version {
+                registration["clientVersion"] = serde_json::json!(version);
+            }
+            client.send(Message::Text(registration.to_string())).await.unwrap();
+            next_server_challenge(&mut client).await;
+            let error = next_json(&mut client).await;
+            assert_eq!(error["type"], "version-too-old");
+            assert_eq!(error["currentVersion"], version.unwrap_or("unknown"));
+            assert_eq!(error["minimumVersion"], "3.0.0");
+            assert_eq!(error["downloadUrl"], client_download_url());
+            match timeout(Duration::from_secs(1), client.next()).await.unwrap() {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
+                Some(Ok(message)) => panic!("legacy client must not be admitted: {message:?}"),
+            }
+            server_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn legacy_register_protocol_is_rejected_after_challenge() {
         let (address, server_task) =
             start_connection_server(tokio::time::Duration::from_secs(1)).await;
@@ -5995,6 +6014,29 @@ mod tests {
     }
 
     // 正常连接不应被空闲超时误杀：客户端持续发送应用层 ping 即可续期。
+    #[tokio::test]
+    async fn proxy_clients_do_not_share_message_budget() {
+        let (address, server) = spawn_test_server().await;
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let (mut client, _) = connect_async(format!("ws://{address}")).await.unwrap();
+            next_server_challenge(&mut client).await;
+            clients.push(client);
+        }
+        // 135 messages from one TCP source exceed the former shared 120-message
+        // budget while every individual connection remains below its limit.
+        for _ in 0..45 {
+            for client in &mut clients {
+                client.send(Message::Text(r#"{"type":"ping"}"#.into())).await.unwrap();
+                assert_eq!(next_json(client).await["type"], "pong");
+            }
+        }
+        for mut client in clients {
+            client.close(None).await.unwrap();
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn active_session_is_not_closed_by_idle_timeout() {
         let (address, server) =
