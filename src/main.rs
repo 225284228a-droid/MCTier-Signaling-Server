@@ -15,7 +15,8 @@ use std::sync::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex, RwLock, Semaphore};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{accept_async_with_config, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
+mod connection_guard;
 
 /// 默认要求的最低客户端版本（可通过环境变量 MINIMUM_CLIENT_VERSION 覆盖）
 const DEFAULT_MINIMUM_CLIENT_VERSION: &str = "3.0.0";
@@ -311,6 +312,11 @@ pub enum SignalingMessage {
         offer: OfferData,
         #[serde(rename = "playerName", skip_serializing_if = "Option::is_none")]
         player_name: Option<String>,
+    },
+    /// Request a fresh voice negotiation with one authenticated lobby member.
+    VoiceReconnect {
+        from: String,
+        to: String,
     },
     /// WebRTC Answer
     Answer {
@@ -667,6 +673,7 @@ impl SignalingMessage {
     fn claimed_sender(&self, _raw: &str) -> Option<String> {
         match self {
             Self::Offer { from, .. }
+            | Self::VoiceReconnect { from, .. }
             | Self::Answer { from, .. }
             | Self::IceCandidate { from, .. }
             | Self::ChatMessage { from, .. }
@@ -1176,6 +1183,7 @@ fn validate_message_shape(message: &SignalingMessage) -> bool {
         SignalingMessage::Answer { from, to, answer } => {
             ids(from, to) && valid_answer_data(answer, "answer")
         }
+        SignalingMessage::VoiceReconnect { from, to } => ids(from, to) && from != to,
         SignalingMessage::IceCandidate {
             from,
             to,
@@ -1601,12 +1609,10 @@ async fn is_current_session(
         .unwrap_or(false)
 }
 
-/// 生成大厅ID（基于大厅名称和密码的哈希）
-fn generate_lobby_id(lobby_name: &str, password: &str) -> String {
+/// A room name identifies one lobby; its password is checked separately.
+fn generate_lobby_id(lobby_name: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(lobby_name.as_bytes());
-    hasher.update(b":");
-    hasher.update(password.as_bytes());
     let result = hasher.finalize();
     format!("{:x}", result)
 }
@@ -2181,6 +2187,7 @@ async fn handle_community_node_submit_with_limits(
     address: String,
     submitter: Option<String>,
 ) -> SignalingMessage {
+    let peer = SocketAddr::new(connection_guard::quota_source(peer.ip()), peer.port());
     let reject = |message: &str| SignalingMessage::CommunityNodeSubmitResult {
         ok: false,
         message: message.to_string(),
@@ -2313,7 +2320,8 @@ async fn main() {
     log::info!("最低客户端版本: {}", minimum_client_version());
     let max_connections = max_connections();
     log::info!("最大并发连接数: {}", max_connections);
-    let connection_semaphore = Arc::new(Semaphore::new(max_connections));
+    let admission = connection_guard::admission();
+    log::info!("Trusted reverse proxies: {:?}", admission.trusted_proxies);
 
     // 创建大厅列表和客户端映射
     let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
@@ -2354,15 +2362,10 @@ async fn main() {
             Ok((stream, addr)) => {
                 log::info!("新客户端连接: {}", addr);
 
-                let connection_permit = match Arc::clone(&connection_semaphore).try_acquire_owned()
-                {
+                let connection_permit = match admission.pending(addr.ip()) {
                     Ok(permit) => permit,
-                    Err(_) => {
-                        log::warn!(
-                            "连接数已达上限（{}），拒绝客户端: {}",
-                            max_connections,
-                            addr
-                        );
+                    Err(reason) => {
+                        log::warn!("Handshake admission rejected {}: {}", addr, reason);
                         continue;
                     }
                 };
@@ -2374,7 +2377,6 @@ async fn main() {
                 let probe_limiter_clone = Arc::clone(&probe_limiter);
 
                 tokio::spawn(async move {
-                    let _connection_permit = connection_permit;
                     if let Err(e) = handle_connection(
                         stream,
                         addr,
@@ -2384,6 +2386,7 @@ async fn main() {
                         submit_cooldowns_clone,
                         submit_quotas_clone,
                         probe_limiter_clone,
+                        connection_permit,
                     )
                     .await
                     {
@@ -2410,6 +2413,7 @@ async fn handle_connection(
     submit_cooldowns: SubmitCooldowns,
     submit_quotas: SubmitQuotas,
     probe_limiter: ProbeLimiter,
+    pending: connection_guard::Lease,
 ) -> Result<(), Box<dyn std::error::Error>> {
     handle_connection_with_timeouts_and_limits(
         stream,
@@ -2423,6 +2427,8 @@ async fn handle_connection(
         tokio::time::Duration::from_secs(WEBSOCKET_HANDSHAKE_TIMEOUT_SECS),
         tokio::time::Duration::from_secs(REGISTRATION_TIMEOUT_SECS),
         tokio::time::Duration::from_secs(REGISTERED_IDLE_TIMEOUT_SECS),
+        Some(pending),
+        connection_guard::admission(),
     )
     .await
 }
@@ -2452,6 +2458,8 @@ async fn handle_connection_with_timeouts(
         handshake_timeout,
         registration_timeout,
         idle_timeout,
+        None,
+        connection_guard::admission(),
     )
     .await
 }
@@ -2469,11 +2477,27 @@ async fn handle_connection_with_timeouts_and_limits(
     handshake_timeout: tokio::time::Duration,
     registration_timeout: tokio::time::Duration,
     idle_timeout: tokio::time::Duration,
+    pending: Option<connection_guard::Lease>,
+    admission: &connection_guard::Admission,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut active_lease = None;
+    let mut source_ip = addr.ip();
     // 升级到 WebSocket
     let ws_stream = match tokio::time::timeout(
         handshake_timeout,
-        accept_async_with_config(stream, Some(websocket_config())),
+        tokio_tungstenite::accept_hdr_async_with_config(stream, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+            let result = admission.source(addr.ip(), request.headers()).and_then(|ip| {
+                let lease = admission.active(ip)?;
+                source_ip = ip;
+                active_lease = Some(lease);
+                Ok(())
+            });
+            match result {
+                Ok(()) => Ok(response),
+                Err(reason) => Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(429).body(Some(reason.to_owned())).unwrap()),
+            }
+        }, Some(websocket_config())),
     )
     .await
     {
@@ -2487,6 +2511,9 @@ async fn handle_connection_with_timeouts_and_limits(
             return Ok(());
         }
     };
+    drop(pending);
+    let _active_lease = active_lease;
+    let source_addr = SocketAddr::new(source_ip, addr.port());
 
     log::info!("✅ WebSocket 连接已建立: {}", addr);
 
@@ -2788,7 +2815,7 @@ async fn handle_connection_with_timeouts_and_limits(
                                     );
 
                                     // 生成大厅ID
-                                    let lid = generate_lobby_id(&lobby_name, &lobby_password);
+                                    let lid = generate_lobby_id(&lobby_name);
 
                                     // 生成密码哈希
                                     let mut hasher = Sha256::new();
@@ -3092,6 +3119,24 @@ async fn handle_connection_with_timeouts_and_limits(
                                         })
                                     {
                                         send_text(&write, json).await;
+                                    }
+                                }
+                                SignalingMessage::VoiceReconnect { from, to } => {
+                                    if !is_registered {
+                                        break;
+                                    }
+                                    let Some(lid) = lobby_id.as_deref() else {
+                                        break;
+                                    };
+                                    let target_id = to.clone();
+                                    let forwarded = SignalingMessage::VoiceReconnect { from, to };
+                                    if let Ok(json) = serde_json::to_string(&forwarded) {
+                                        send_to_lobby_client(
+                                            &lobbies,
+                                            lid,
+                                            &target_id,
+                                            Message::Text(json),
+                                        ).await;
                                     }
                                 }
                                 SignalingMessage::Offer {
@@ -4330,7 +4375,7 @@ async fn handle_connection_with_timeouts_and_limits(
                                         &submit_cooldowns,
                                         &submit_quotas,
                                         &probe_limiter,
-                                        addr,
+                                        source_addr,
                                         name,
                                         address,
                                         submitter,
@@ -5271,6 +5316,77 @@ mod tests {
             "oversized message should be rejected"
         );
     }
+    #[tokio::test]
+    async fn wrong_password_cannot_create_a_second_room_or_obtain_credentials() {
+        let (address, server) = spawn_test_server().await;
+        let url = format!("ws://{address}");
+        let (mut host, _) = connect_async(&url).await.unwrap();
+        send_register_with_ip(&mut host, "password-host", "unique-room", "correct", "10.126.126.1").await;
+        let accepted = next_json(&mut host).await;
+        assert_eq!(accepted["type"], "register-success");
+        assert_eq!(next_json(&mut host).await["type"], "players-list");
+        let (mut wrong, _) = connect_async(&url).await.unwrap();
+        send_register_with_ip(&mut wrong, "password-wrong", "unique-room", "incorrect", "10.126.126.2").await;
+        let rejected = next_json(&mut wrong).await;
+        assert_eq!(rejected["type"], "register-error");
+        assert_eq!(rejected["message"], "密码错误");
+        assert!(rejected.get("chatToken").is_none());
+        let (mut member, _) = connect_async(&url).await.unwrap();
+        send_register_with_ip(&mut member, "password-member", "unique-room", "correct", "10.126.126.3").await;
+        let joined = next_json(&mut member).await;
+        assert_eq!(joined["type"], "register-success");
+        assert_eq!(joined["lobbyId"], accepted["lobbyId"]);
+        assert_eq!(next_json(&mut host).await["type"], "chat-token-rotated");
+        assert_eq!(next_json(&mut host).await["type"], "player-joined");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_headers_isolate_connection_and_submission_limits_over_websocket() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let policy = Arc::new(connection_guard::Admission::new(16, 2, "127.0.0.1").unwrap());
+        let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
+        let clients: ClientLobbyMap = Arc::new(RwLock::new(HashMap::new()));
+        let nodes: CommunityNodes = Arc::new(RwLock::new(HashMap::new()));
+        let cooldowns: SubmitCooldowns = Arc::new(RwLock::new(HashMap::new()));
+        let quotas: SubmitQuotas = Arc::new(Mutex::new(HashMap::new()));
+        // Saturate only the probe queue so submissions exercise quotas without network I/O.
+        let probes = Arc::new(Semaphore::new(0));
+        let server = tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                let (policy, lobbies, clients, nodes, cooldowns, quotas, probes) =
+                    (policy.clone(), lobbies.clone(), clients.clone(), nodes.clone(), cooldowns.clone(), quotas.clone(), probes.clone());
+                tokio::spawn(async move {
+                    let _ = handle_connection_with_timeouts_and_limits(stream, peer, lobbies, clients, nodes, cooldowns, quotas, probes,
+                        Duration::from_secs(2), Duration::from_secs(15), Duration::from_secs(60), None, &policy).await;
+                });
+            }
+        });
+        let request = |ip: &str| {
+            let mut request = format!("ws://{address}").into_client_request().unwrap();
+            request.headers_mut().insert("x-forwarded-for", ip.parse().unwrap());
+            request
+        };
+        let (mut a, _) = connect_async(request("192.0.2.1")).await.unwrap();
+        let (_a2, _) = connect_async(request("192.0.2.1")).await.unwrap();
+        assert!(connect_async(request("192.0.2.1")).await.is_err());
+        let (mut b, _) = connect_async(request("192.0.2.2")).await.unwrap();
+        assert!(connect_async(format!("ws://{address}")).await.is_err(), "missing forwarded identity must not share the proxy IP");
+        let submit = Message::Text(serde_json::json!({"type":"community-node-submit", "name":"test", "address":"tcp://127.0.0.1:9"}).to_string());
+        a.send(submit.clone()).await.unwrap();
+        let first = next_json(&mut a).await;
+        assert_eq!(first["ok"], false);
+        a.send(submit.clone()).await.unwrap();
+        let limited = next_json(&mut a).await;
+        assert!(limited["message"].as_str().unwrap().contains("频繁"));
+        b.send(submit).await.unwrap();
+        let independent = next_json(&mut b).await;
+        assert!(!independent["message"].as_str().unwrap().contains("频繁"));
+        server.abort();
+    }
+
     async fn spawn_test_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         spawn_test_server_with_idle_timeout(tokio::time::Duration::from_secs(
             REGISTERED_IDLE_TIMEOUT_SECS,
@@ -6014,6 +6130,54 @@ mod tests {
     }
 
     // 正常连接不应被空闲超时误杀：客户端持续发送应用层 ping 即可续期。
+    #[tokio::test]
+    async fn voice_reconnect_routes_only_between_authenticated_lobby_members() {
+        let (address, server) = spawn_test_server().await;
+        let url = format!("ws://{address}");
+        let (mut sender, _) = connect_async(&url).await.unwrap();
+        let registered = register(&mut sender, "voice-sender", "voice-room").await;
+        let (mut receiver, _) = connect_async(&url).await.unwrap();
+        register(&mut receiver, "voice-receiver", "voice-room").await;
+        next_json(&mut sender).await; // Token rotation.
+        next_json(&mut sender).await; // Player joined.
+        let (mut outsider, _) = connect_async(&url).await.unwrap();
+        register(&mut outsider, "voice-outsider", "other-room").await;
+        let (_, _, sender_id) = test_identity_key("voice-sender");
+        let (_, _, receiver_id) = test_identity_key("voice-receiver");
+        let (_, _, outsider_id) = test_identity_key("voice-outsider");
+
+        let request = serde_json::json!({"type":"voice-reconnect", "from":sender_id, "to":receiver_id});
+        sender.send(Message::Text(request.to_string())).await.unwrap();
+        let forwarded = next_json(&mut receiver).await;
+        assert_eq!(forwarded["type"], "voice-reconnect");
+        assert_eq!(forwarded["from"], sender_id);
+        assert_eq!(forwarded["to"], receiver_id);
+        assert_eq!(forwarded["sessionGeneration"], registered["sessionGeneration"]);
+
+        for from in [&outsider_id, &sender_id] {
+            // Both an authentic outsider and one claiming the sender's ID fail.
+            outsider.send(Message::Text(serde_json::json!({
+                "type":"voice-reconnect", "from":from, "to":receiver_id
+            }).to_string())).await.unwrap();
+            outsider.send(Message::Text(r#"{"type":"ping"}"#.into())).await.unwrap();
+            assert_eq!(next_json(&mut outsider).await["type"], "pong");
+            receiver.send(Message::Text(r#"{"type":"ping"}"#.into())).await.unwrap();
+            assert_eq!(next_json(&mut receiver).await["type"], "pong");
+        }
+        let (mut unregistered, _) = connect_async(&url).await.unwrap();
+        next_server_challenge(&mut unregistered).await;
+        unregistered.send(Message::Text(request.to_string())).await.unwrap();
+        unregistered.send(Message::Text(r#"{"type":"ping"}"#.into())).await.unwrap();
+        assert_eq!(next_json(&mut unregistered).await["type"], "pong");
+        receiver.send(Message::Text(r#"{"type":"ping"}"#.into())).await.unwrap();
+        assert_eq!(next_json(&mut receiver).await["type"], "pong");
+        for (from, to) in [("", receiver_id.as_str()), (sender_id.as_str(), "bad\ntarget"), (sender_id.as_str(), sender_id.as_str())] {
+            let invalid = SignalingMessage::VoiceReconnect { from: from.into(), to: to.into() };
+            assert!(!validate_message_shape(&invalid));
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn proxy_clients_do_not_share_message_budget() {
         let (address, server) = spawn_test_server().await;
