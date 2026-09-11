@@ -1601,12 +1601,10 @@ async fn is_current_session(
         .unwrap_or(false)
 }
 
-/// 生成大厅ID（基于大厅名称和密码的哈希）
-fn generate_lobby_id(lobby_name: &str, password: &str) -> String {
+/// A lobby name identifies one room; its password is checked separately.
+fn generate_lobby_id(lobby_name: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(lobby_name.as_bytes());
-    hasher.update(b":");
-    hasher.update(password.as_bytes());
     let result = hasher.finalize();
     format!("{:x}", result)
 }
@@ -2788,7 +2786,7 @@ async fn handle_connection_with_timeouts_and_limits(
                                     );
 
                                     // 生成大厅ID
-                                    let lid = generate_lobby_id(&lobby_name, &lobby_password);
+                                    let lid = generate_lobby_id(&lobby_name);
 
                                     // 生成密码哈希
                                     let mut hasher = Sha256::new();
@@ -2824,13 +2822,8 @@ async fn handle_connection_with_timeouts_and_limits(
                                         // retry after the previous connection finishes cleanup.
                                         break;
                                     }
-                                     // Check an existing lobby before creating a new one. This avoids
-                                     // leaving an empty, token-bearing lobby behind after a bad join,
-                                     // and ensures wrong passwords cannot split into a ghost lobby.
-                                     let existing_lobby = lobbies_write
-                                         .values()
-                                         .find(|existing| existing.lobby_name == lobby_name);
-                                     if let Some(existing) = existing_lobby {
+                                    // Check before insertion while holding the same lobby write lock.
+                                    if let Some(existing) = lobbies_write.get(&lid) {
                                         if existing.password_hash != password_hash {
                                             log::warn!(
                                                 "❌ 密码错误: {} 尝试加入大厅 {}",
@@ -6589,9 +6582,36 @@ mod tests {
         let peer_err = next_json(&mut peer).await;
         assert_eq!(peer_err["type"], "register-error");
         assert_eq!(peer_err["message"], "密码错误");
+        assert!(peer_err.get("chatToken").is_none());
+
+        let (mut member, _) = connect_async(format!("ws://{}", address)).await.unwrap();
+        send_register_with_ip(&mut member, "correct_peer", "private_room", "password", "10.126.126.13").await;
+        let member_success = next_json(&mut member).await;
+        assert_eq!(member_success["type"], "register-success");
+        assert_eq!(member_success["lobbyId"], host_success["lobbyId"]);
 
         host.close(None).await.unwrap();
         peer.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn separator_in_lobby_credentials_cannot_merge_distinct_rooms() {
+        let (address, server) = spawn_test_server().await;
+        let (mut host, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        send_register_with_ip(&mut host, "separator-host", "alpha:beta", "gamma", "10.126.126.1").await;
+        let first = next_json(&mut host).await;
+        assert_eq!(first["type"], "register-success");
+        let (mut other, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        send_register_with_ip(&mut other, "separator-other", "alpha", "beta:gamma", "10.126.126.2").await;
+        let second = next_json(&mut other).await;
+        assert_eq!(second["type"], "register-success");
+        assert_ne!(first["lobbyId"], second["lobbyId"], "distinct lobby names must not share a room");
+        assert_ne!(first["hostId"], second["hostId"]);
+        assert_ne!(first["chatToken"], second["chatToken"]);
+        let roster = next_json(&mut other).await;
+        assert_eq!(roster["type"], "players-list");
+        assert!(!roster.to_string().contains(&test_client_id("separator-host")));
         server.abort();
     }
 }
