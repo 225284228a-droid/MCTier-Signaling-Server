@@ -2824,9 +2824,13 @@ async fn handle_connection_with_timeouts_and_limits(
                                         // retry after the previous connection finishes cleanup.
                                         break;
                                     }
-                                    // Check an existing lobby before creating a new one. This avoids
-                                    // leaving an empty, token-bearing lobby behind after a bad join.
-                                    if let Some(existing) = lobbies_write.get(&lid) {
+                                     // Check an existing lobby before creating a new one. This avoids
+                                     // leaving an empty, token-bearing lobby behind after a bad join,
+                                     // and ensures wrong passwords cannot split into a ghost lobby.
+                                     let existing_lobby = lobbies_write
+                                         .values()
+                                         .find(|existing| existing.lobby_name == lobby_name);
+                                     if let Some(existing) = existing_lobby {
                                         if existing.password_hash != password_hash {
                                             log::warn!(
                                                 "❌ 密码错误: {} 尝试加入大厅 {}",
@@ -6560,6 +6564,34 @@ mod tests {
             result["message"]
         );
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_rejected_and_does_not_create_ghost_lobby() {
+        let (address, server) = spawn_test_server().await;
+        let (mut host, _) = connect_async(format!("ws://{}", address)).await.unwrap();
+        let (mut peer, _) = connect_async(format!("ws://{}", address)).await.unwrap();
+
+        // 房主创建房间（默认密码为 "password"）
+        let host_success = register(&mut host, "host_user", "private_room").await;
+        assert_eq!(host_success["type"], "register-success");
+
+        // 第二个玩家输入错误密码尝试加入同名大厅
+        send_register_with_ip(
+            &mut peer,
+            "peer_user",
+            "private_room",
+            "wrong_pass",
+            "10.126.126.12",
+        )
+        .await;
+        let peer_err = next_json(&mut peer).await;
+        assert_eq!(peer_err["type"], "register-error");
+        assert_eq!(peer_err["message"], "密码错误");
+
+        host.close(None).await.unwrap();
+        peer.close(None).await.unwrap();
         server.abort();
     }
 }
