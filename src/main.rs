@@ -55,7 +55,6 @@ const MAX_CONTROL_TEXT_LEN: usize = 8 * 1024;
 const MAX_MESSAGES_PER_WINDOW: u32 = 120;
 const MESSAGE_RATE_WINDOW_SECS: u64 = 10;
 const MAX_TRACKED_IP_MESSAGE_LIMITERS: usize = 8192;
-const DEFAULT_MAX_CONNECTIONS_PER_IPV4: usize = 8;
 const MAX_OUTBOUND_FRAMES_PER_WINDOW: u32 = 64;
 const MAX_OUTBOUND_BYTES_PER_WINDOW: usize = 1024 * 1024;
 const OUTBOUND_BUDGET_WINDOW_SECS: u64 = 1;
@@ -880,7 +879,6 @@ fn allow_submit_quota(quota: &mut SubmitQuota) -> bool {
 type SubmitQuotas = Arc<Mutex<HashMap<std::net::IpAddr, SubmitQuota>>>;
 type ProbeLimiter = Arc<Semaphore>;
 type IpMessageLimiters = Arc<Mutex<HashMap<std::net::IpAddr, MessageRateLimiter>>>;
-type IpConnectionCounts = Arc<Mutex<HashMap<std::net::IpAddr, usize>>>;
 
 #[derive(Debug)]
 struct OutboundBudget {
@@ -945,38 +943,6 @@ fn connection_limit_from_env(value: Option<&str>) -> usize {
 
 fn max_connections() -> usize {
     connection_limit_from_env(std::env::var("MAX_CONNECTIONS").ok().as_deref())
-}
-
-fn max_connections_per_ip() -> usize {
-    std::env::var("MAX_CONNECTIONS_PER_IP")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|limit| *limit > 0)
-        .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IPV4)
-}
-
-async fn try_acquire_ip_connection(
-    counts: &IpConnectionCounts,
-    ip: std::net::IpAddr,
-    limit: usize,
-) -> bool {
-    let mut counts = counts.lock().await;
-    let count = counts.entry(ip).or_default();
-    if *count >= limit {
-        return false;
-    }
-    *count += 1;
-    true
-}
-
-async fn release_ip_connection(counts: &IpConnectionCounts, ip: std::net::IpAddr) {
-    let mut counts = counts.lock().await;
-    if let Some(count) = counts.get_mut(&ip) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            counts.remove(&ip);
-        }
-    }
 }
 
 async fn allow_ip_message(limiters: &IpMessageLimiters, ip: std::net::IpAddr) -> bool {
@@ -2365,9 +2331,6 @@ async fn main() {
     let max_connections = max_connections();
     log::info!("最大并发连接数: {}", max_connections);
     let connection_semaphore = Arc::new(Semaphore::new(max_connections));
-    let max_connections_per_ip = max_connections_per_ip();
-    log::info!("每来源地址最大并发连接数: {}", max_connections_per_ip);
-    let ip_connection_counts: IpConnectionCounts = Arc::new(Mutex::new(HashMap::new()));
     let ip_message_limiters: IpMessageLimiters = Arc::new(Mutex::new(HashMap::new()));
 
     // 创建大厅列表和客户端映射
@@ -2421,22 +2384,6 @@ async fn main() {
                         continue;
                     }
                 };
-                let ip_connection_acquired = try_acquire_ip_connection(
-                    &ip_connection_counts,
-                    addr.ip(),
-                    max_connections_per_ip,
-                )
-                .await;
-                if !ip_connection_acquired {
-                    log::warn!(
-                        "来源地址连接数已达上限（{}），拒绝客户端: {}",
-                        max_connections_per_ip,
-                        addr
-                    );
-                    drop(connection_permit);
-                    continue;
-                }
-
                 let lobbies_clone = Arc::clone(&lobbies);
                 let client_lobby_map_clone = Arc::clone(&client_lobby_map);
                 let community_nodes_clone = Arc::clone(&community_nodes);
@@ -2444,8 +2391,6 @@ async fn main() {
                 let submit_quotas_clone = Arc::clone(&submit_quotas);
                 let probe_limiter_clone = Arc::clone(&probe_limiter);
                 let ip_message_limiters_clone = Arc::clone(&ip_message_limiters);
-                let ip_connection_counts_clone = Arc::clone(&ip_connection_counts);
-                let peer_ip = addr.ip();
 
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
@@ -2464,7 +2409,6 @@ async fn main() {
                     {
                         log::error!("处理客户端连接失败 ({}): {}", addr, e);
                     }
-                    release_ip_connection(&ip_connection_counts_clone, peer_ip).await;
                 });
             }
             Err(e) => {
