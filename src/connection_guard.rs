@@ -133,11 +133,32 @@ impl Admission {
             if chain.len() > 16 {
                 return Err("forwarded chain too long");
             }
-            return chain
+            let client = chain
                 .into_iter()
                 .rev()
                 .find(|ip| !self.trusted_proxies.contains(ip))
-                .ok_or("forwarded chain has no client address");
+                .ok_or("forwarded chain has no client address")?;
+            // A proxy that overwrites X-Real-IP but forwards the client-supplied
+            // X-Forwarded-For unchanged would otherwise let attackers pick their
+            // own quota bucket. Fail closed on a conflicting client claim; a
+            // trusted-proxy X-Real-IP only vouches for the previous hop and is
+            // ignored, which keeps multi-tier trusted chains usable.
+            match headers.get_all("x-real-ip").iter().count() {
+                0 => {}
+                1 => {
+                    let real = headers["x-real-ip"]
+                        .to_str()
+                        .ok()
+                        .and_then(|s| s.parse::<IpAddr>().ok())
+                        .map(canonical)
+                        .ok_or("invalid real address")?;
+                    if !self.trusted_proxies.contains(&real) && real != client {
+                        return Err("conflicting forwarded address");
+                    }
+                }
+                _ => return Err("ambiguous forwarded address"),
+            }
+            return Ok(client);
         }
         if headers.get_all("x-real-ip").iter().count() != 1 {
             return Err("trusted proxy must send client address");
@@ -203,6 +224,51 @@ mod tests {
         assert!(guard
             .source("127.0.0.1".parse().unwrap(), &HeaderMap::new())
             .is_err());
+    }
+
+    #[test]
+    fn forwarded_chain_must_agree_with_a_client_x_real_ip_vouch() {
+        let guard = Admission::new(16, 4, "127.0.0.1,::1").unwrap();
+        let mut headers = HeaderMap::new();
+        // 报告场景：代理转发了客户端注入的 XFF，但同时写入了权威 X-Real-IP。
+        // 两者冲突时必须拒绝，否则攻击者可自选配额桶绕过限流。
+        headers.insert("x-forwarded-for", "198.51.100.23".parse().unwrap());
+        headers.insert("x-real-ip", "192.0.2.7".parse().unwrap());
+        assert_eq!(
+            guard.source("127.0.0.1".parse().unwrap(), &headers)
+                .unwrap_err(),
+            "conflicting forwarded address"
+        );
+        // 一致的声明放行。
+        headers.insert("x-forwarded-for", "192.0.2.7".parse().unwrap());
+        assert_eq!(
+            guard
+                .source("127.0.0.1".parse().unwrap(), &headers)
+                .unwrap()
+                .to_string(),
+            "192.0.2.7"
+        );
+        // 多层受信链：X-Real-IP 只为上一跳（受信代理）背书时忽略，不影响解析。
+        let mut chained = HeaderMap::new();
+        chained.insert("x-forwarded-for", "192.0.2.7, 198.51.100.8".parse().unwrap());
+        chained.insert("x-real-ip", "127.0.0.1".parse().unwrap());
+        assert_eq!(
+            guard
+                .source("127.0.0.1".parse().unwrap(), &chained)
+                .unwrap()
+                .to_string(),
+            "198.51.100.8"
+        );
+        // 多个 X-Real-IP 与 XFF 并存同样视为歧义。
+        let mut ambiguous = HeaderMap::new();
+        ambiguous.insert("x-forwarded-for", "192.0.2.7".parse().unwrap());
+        ambiguous.insert("x-real-ip", "192.0.2.7".parse().unwrap());
+        ambiguous.append("x-real-ip", "198.51.100.23".parse().unwrap());
+        assert_eq!(
+            guard.source("127.0.0.1".parse().unwrap(), &ambiguous)
+                .unwrap_err(),
+            "ambiguous forwarded address"
+        );
     }
 
     #[test]
