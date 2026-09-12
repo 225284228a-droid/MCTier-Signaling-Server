@@ -5,9 +5,10 @@ use p256::pkcs8::DecodePublicKey;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Instant;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, OnceLock,
@@ -828,6 +829,8 @@ struct ClientInfo {
 struct LobbyInfo {
     lobby_name: String,
     password_hash: String,
+    /// 密码哈希盐：大厅创建时随机生成，杜绝无盐彩虹表命中。
+    password_salt: String,
     clients: HashMap<String, ClientInfo>,
     /// 房主客户端ID
     host_id: String,
@@ -964,6 +967,29 @@ fn random_hex<const N: usize>() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// 大厅密码盐长度：每个大厅创建时生成，随大厅生命周期存放于内存。
+const LOBBY_PASSWORD_SALT_BYTES: usize = 16;
+
+/// 大厅密码哈希混合每大厅随机盐，使弱口令无法命中现成的彩虹表。
+fn hash_lobby_password(salt: &str, password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    hasher.update(password.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// 常量时间比较，避免密码哈希校验的时间侧信道
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 fn random_session_generation() -> u64 {
     // Keep the value in JavaScript's safe-integer range while retaining at
     // least 16 decimal digits for desktop clients' generation validator.
@@ -1050,6 +1076,60 @@ impl MessageRateLimiter {
         self.messages += 1;
         true
     }
+}
+
+const MAX_REGISTER_PASSWORD_FAILURES: usize = 5;
+const REGISTER_PASSWORD_FAILURE_WINDOW_SECS: u64 = 300;
+/// 失败表键数量上限，防止攻击者通过轮换来源 IP 撑大内存。
+const MAX_REGISTER_PASSWORD_KEYS: usize = 4096;
+
+/// 大厅密码失败限制器：与 file_transfer 的共享密码限制器同构。
+/// 同一来源 IP 对同一大厅的连续错误密码会触发锁定，且错误会直接断开
+/// WebSocket，迫使攻击者每次尝试都重新完成握手与身份签名。
+struct RegisterPasswordFailures {
+    attempts: HashMap<(IpAddr, String), VecDeque<Instant>>,
+}
+
+impl RegisterPasswordFailures {
+    fn prune(&mut self, now: Instant) {
+        let window = tokio::time::Duration::from_secs(REGISTER_PASSWORD_FAILURE_WINDOW_SECS);
+        self.attempts.retain(|_, attempts| {
+            while attempts
+                .front()
+                .is_some_and(|attempt| now.duration_since(*attempt) > window)
+            {
+                attempts.pop_front();
+            }
+            !attempts.is_empty()
+        });
+    }
+
+    /// 返回 true 表示该 (来源, 大厅) 已锁定或进入保护表，必须拒绝本次尝试。
+    fn is_locked(&mut self, key: &(IpAddr, String), now: Instant) -> bool {
+        self.prune(now);
+        match self.attempts.get(key) {
+            Some(attempts) => attempts.len() >= MAX_REGISTER_PASSWORD_FAILURES,
+            None => self.attempts.len() >= MAX_REGISTER_PASSWORD_KEYS,
+        }
+    }
+
+    fn record_failure(&mut self, key: &(IpAddr, String), now: Instant) {
+        self.attempts.entry(key.clone()).or_default().push_back(now);
+    }
+
+    fn clear(&mut self, key: &(IpAddr, String)) {
+        self.attempts.remove(key);
+    }
+}
+
+fn register_password_failures() -> &'static std::sync::Mutex<RegisterPasswordFailures> {
+    static VALUE: std::sync::OnceLock<std::sync::Mutex<RegisterPasswordFailures>> =
+        std::sync::OnceLock::new();
+    VALUE.get_or_init(|| {
+        std::sync::Mutex::new(RegisterPasswordFailures {
+            attempts: HashMap::new(),
+        })
+    })
 }
 
 fn rotate_chat_token(lobby: &mut LobbyInfo) -> (String, u64) {
@@ -2842,12 +2922,6 @@ async fn handle_connection_with_timeouts_and_limits(
                                     // 生成大厅ID
                                     let lid = generate_lobby_id(&lobby_name);
 
-                                    // 生成密码哈希
-                                    let mut hasher = Sha256::new();
-                                    hasher.update(lobby_password.as_bytes());
-                                    let password_hash = format!("{:x}", hasher.finalize());
-
-                                    // 获取或创建大厅
                                     let mut lobbies_write = lobbies.write().await;
                                     let existing_client_lobby = lobbies_write
                                         .iter()
@@ -2876,23 +2950,80 @@ async fn handle_connection_with_timeouts_and_limits(
                                         // retry after the previous connection finishes cleanup.
                                         break;
                                     }
-                                    // Check before insertion while holding the same lobby write lock.
+
+                                    // 密码失败熔断以 (来源IP, 大厅) 为键。先查锁定再比较，
+                                    // 锁定期间即使密码正确也拒绝，防止把熔断当作校验预言机。
+                                    let quota_ip = connection_guard::quota_source(source_ip);
+                                    let failure_key = (quota_ip, lid.clone());
+                                    let now = Instant::now();
+                                    let locked = {
+                                        let mut failures = register_password_failures()
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        failures.is_locked(&failure_key, now)
+                                    };
+                                    if locked {
+                                        drop(lobbies_write);
+                                        log::warn!(
+                                            "🚫 密码失败次数过多，暂时拒绝 {} 加入大厅 {}",
+                                            player_name,
+                                            lobby_name
+                                        );
+                                        let error_msg = SignalingMessage::RegisterError {
+                                            message: "密码错误次数过多，请稍后再试".to_string(),
+                                        };
+                                        if let Ok(json) = serde_json::to_string(&error_msg) {
+                                            send_text(&write, json).await;
+                                        }
+                                        break;
+                                    }
+
+                                    // 获取或创建大厅
                                     if let Some(existing) = lobbies_write.get(&lid) {
-                                        if existing.password_hash != password_hash {
+                                        let supplied_hash = hash_lobby_password(
+                                            &existing.password_salt,
+                                            &lobby_password,
+                                        );
+                                        if !ct_eq(
+                                            supplied_hash.as_bytes(),
+                                            existing.password_hash.as_bytes(),
+                                        ) {
+                                            let locked = {
+                                                let mut failures = register_password_failures()
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                if failures.is_locked(&failure_key, now) {
+                                                    true
+                                                } else {
+                                                    failures.record_failure(&failure_key, now);
+                                                    false
+                                                }
+                                            };
+                                            drop(lobbies_write);
                                             log::warn!(
                                                 "❌ 密码错误: {} 尝试加入大厅 {}",
                                                 player_name,
                                                 lobby_name
                                             );
-                                            drop(lobbies_write);
+                                            let message = if locked {
+                                                "密码错误次数过多，请稍后再试".to_string()
+                                            } else {
+                                                "密码错误".to_string()
+                                            };
                                             let error_msg = SignalingMessage::RegisterError {
-                                                message: "密码错误".to_string(),
+                                                message,
                                             };
                                             if let Ok(json) = serde_json::to_string(&error_msg) {
                                                 send_text(&write, json).await;
                                             }
-                                            continue;
+                                            // 断开连接：每次猜测都必须重新握手并重新签名，
+                                            // 无法在同一连接内高速枚举大厅密码。
+                                            break;
                                         }
+                                        register_password_failures()
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .clear(&failure_key);
                                     }
 
                                     let lobby =
@@ -2903,9 +3034,14 @@ async fn handle_connection_with_timeouts_and_limits(
                                                 lid,
                                                 cid
                                             );
+                                            let password_salt = random_hex::<LOBBY_PASSWORD_SALT_BYTES>();
                                             LobbyInfo {
                                                 lobby_name: lobby_name.clone(),
-                                                password_hash: password_hash.clone(),
+                                                password_hash: hash_lobby_password(
+                                                    &password_salt,
+                                                    &lobby_password,
+                                                ),
+                                                password_salt,
                                                 clients: HashMap::new(),
                                                 host_id: cid.clone(), // 首个创建者即房主
                                                 max_players: None,
@@ -5118,6 +5254,7 @@ mod tests {
             LobbyInfo {
                 lobby_name: "lobby".to_string(),
                 password_hash: String::new(),
+                password_salt: String::new(),
                 clients,
                 host_id: "slow".to_string(),
                 max_players: None,
@@ -5340,6 +5477,73 @@ mod tests {
             "oversized message should be rejected"
         );
     }
+    #[test]
+    fn lobby_password_hash_uses_salt_and_constant_time_compare() {
+        let salt = random_hex::<LOBBY_PASSWORD_SALT_BYTES>();
+        let correct = hash_lobby_password(&salt, "pw");
+        assert_eq!(correct, hash_lobby_password(&salt, "pw"));
+        assert_ne!(correct, hash_lobby_password(&salt, "PW"));
+        assert_ne!(correct, hash_lobby_password(&random_hex::<LOBBY_PASSWORD_SALT_BYTES>(), "pw"));
+        assert!(ct_eq(correct.as_bytes(), hash_lobby_password(&salt, "pw").as_bytes()));
+        assert!(!ct_eq(correct.as_bytes(), b"different"));
+        assert!(!ct_eq(b"short", b"longer value"));
+    }
+
+    #[test]
+    fn register_password_failures_lock_after_threshold_and_expire() {
+        let key = ("192.0.2.9".parse().unwrap(), "lock-lobby".to_string());
+        let now = Instant::now();
+        let mut tracker = RegisterPasswordFailures {
+            attempts: HashMap::new(),
+        };
+        for _ in 0..MAX_REGISTER_PASSWORD_FAILURES {
+            assert!(!tracker.is_locked(&key, now));
+            tracker.record_failure(&key, now);
+        }
+        assert!(tracker.is_locked(&key, now));
+        let later = now
+            + std::time::Duration::from_secs(REGISTER_PASSWORD_FAILURE_WINDOW_SECS + 1);
+        assert!(!tracker.is_locked(&key, later));
+        assert!(tracker.attempts.is_empty());
+        tracker.record_failure(&key, later);
+        tracker.clear(&key);
+        assert!(tracker.attempts.is_empty());
+        assert!(!tracker.is_locked(&key, later));
+    }
+
+    #[tokio::test]
+    async fn repeated_wrong_passwords_close_connections_and_lock_the_source() {
+        let (address, server) = spawn_test_server().await;
+        let url = format!("ws://{address}");
+        let (mut host, _) = connect_async(&url).await.unwrap();
+        send_register_with_ip(&mut host, "brute-host", "brute-room", "correct", "10.126.126.1").await;
+        assert_eq!(next_json(&mut host).await["type"], "register-success");
+        assert_eq!(next_json(&mut host).await["type"], "players-list");
+        for _ in 0..MAX_REGISTER_PASSWORD_FAILURES {
+            let (mut wrong, _) = connect_async(&url).await.unwrap();
+            send_register_with_ip(&mut wrong, "brute", "brute-room", "bad", "10.126.126.2").await;
+            let rejected = next_json(&mut wrong).await;
+            assert_eq!(rejected["type"], "register-error");
+            assert_eq!(rejected["message"], "密码错误");
+            // 每次失败都必须断开连接，攻击者无法在同一连接内继续枚举。
+            match timeout(Duration::from_secs(1), wrong.next()).await.unwrap() {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
+                Some(Ok(message)) => panic!("wrong-password session stayed open with {message:?}"),
+            }
+        }
+        // 锁定期内即使密码正确也拒绝，且连接同样被关闭。
+        let (mut locked, _) = connect_async(&url).await.unwrap();
+        send_register_with_ip(&mut locked, "brute", "brute-room", "correct", "10.126.126.3").await;
+        let rejected = next_json(&mut locked).await;
+        assert_eq!(rejected["type"], "register-error");
+        assert_eq!(rejected["message"], "密码错误次数过多，请稍后再试");
+        match timeout(Duration::from_secs(1), locked.next()).await.unwrap() {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => {}
+            Some(Ok(message)) => panic!("locked session stayed open with {message:?}"),
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn wrong_password_cannot_create_a_second_room_or_obtain_credentials() {
         let (address, server) = spawn_test_server().await;
