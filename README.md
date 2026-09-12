@@ -84,7 +84,7 @@ docker compose logs -f
 | `RUST_LOG` | `info` | 日志级别：`error`/`warn`/`info`/`debug`/`trace` |
 | `MINIMUM_CLIENT_VERSION` | `3.0.0` | 允许连接的最低客户端版本，低于此版本会被拒绝 |
 | `CLIENT_DOWNLOAD_URL` | MCTier 官网 | 版本过低时提示给客户端的下载地址 |
-| `MAX_CONNECTIONS` | `1024` | 最大并发 WebSocket 连接数，超出后新连接被直接拒绝 |
+| `MAX_CONNECTIONS` | `4096` | 最大并发 WebSocket 连接数，超出后新连接被直接拒绝 |
 | `MAX_CONNECTIONS_PER_SOURCE` | 未设置（不启用） | 可选的每个真实来源并发上限；只有显式设置正整数（例如 `128`）才启用。同一 NAT 下的用户会共享该额度 |
 | `TRUSTED_PROXIES` | 空 | 逗号分隔的反代 IP 白名单。仅信任这些直接上游的转发头；不能填所有来源或任意内网网段 |
 | `COMMUNITY_NODES_FILE` | `community_nodes.json` | 用户投稿共享节点的存档路径。Docker 部署下为 `/app/data/community_nodes.json`，已挂载命名卷，容器重建后投稿不丢失 |

@@ -73,7 +73,7 @@ const MAX_ERROR_TEXT_LEN: usize = 512;
 const MAX_CHAT_PUBLIC_KEY_LEN: usize = 512;
 
 /// 默认最大并发连接数（可通过环境变量 MAX_CONNECTIONS 覆盖）
-const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 
 /// 已注册连接的空闲超时。
 ///
