@@ -85,16 +85,16 @@ docker compose logs -f
 | `MINIMUM_CLIENT_VERSION` | `3.0.0` | 允许连接的最低客户端版本，低于此版本会被拒绝 |
 | `CLIENT_DOWNLOAD_URL` | MCTier 官网 | 版本过低时提示给客户端的下载地址 |
 | `MAX_CONNECTIONS` | `1024` | 最大并发 WebSocket 连接数，超出后新连接被直接拒绝 |
-| `MAX_CONNECTIONS_PER_SOURCE` | `128`（直接运行时不超过默认总额度的 1/4） | 每个真实来源的并发上限；同一 NAT 下的用户共享该额度，可按部署规模调整 |
+| `MAX_CONNECTIONS_PER_SOURCE` | 未设置（不启用） | 可选的每个真实来源并发上限；只有显式设置正整数（例如 `128`）才启用。同一 NAT 下的用户会共享该额度 |
 | `TRUSTED_PROXIES` | 空 | 逗号分隔的反代 IP 白名单。仅信任这些直接上游的转发头；不能填所有来源或任意内网网段 |
 | `COMMUNITY_NODES_FILE` | `community_nodes.json` | 用户投稿共享节点的存档路径。Docker 部署下为 `/app/data/community_nodes.json`，已挂载命名卷，容器重建后投稿不丢失 |
 | `COMMUNITY_NODE_CAPACITY` | `200` | 共享节点列表容量上限 |
 | `COMMUNITY_NODE_ALLOW_PRIVATE_TARGETS` | `false` | 是否允许探测回环/内网/保留地址。默认只探测公网地址，避免投稿接口被当作内网端口扫描器（SSRF）。仅同内网自建部署才需开启 |
 
-修改环境变量后需要重建容器才会生效：
+修改环境变量后需要强制重建容器才会生效：
 
 ```bash
-docker compose up -d
+docker compose up -d --force-recreate
 ```
 
 ## 反向代理与 HTTPS/WSS
@@ -141,9 +141,11 @@ mctier.example.com {
 
 在 Compose 同目录的 `.env` 中设置 `TRUSTED_PROXIES` 为**信令容器实际看到的代理 IP**。例如实际来源是 `172.20.0.1` 才填写 `TRUSTED_PROXIES=172.20.0.1`；不要照抄其他服务器的地址。可以结合连接日志与 `docker network inspect mctier-network` 确认。直接运行且代理来源为回环地址时，可填写 `127.0.0.1,::1`。
 
-只有受信任代理的 `X-Forwarded-For`（或 `X-Real-IP`）会被使用。多层代理从右向左跳过已配置的可信节点，取最近的非可信来源；格式错误、重复头或缺失真实 IP 的可信代理请求返回 HTTP 429。未配置白名单时，头信息会被忽略，配额按 TCP 来源计算，因此反代部署必须配置白名单。
+只有受信任代理的 `X-Forwarded-For`（或 `X-Real-IP`）会被使用。多层代理从右向左跳过已配置的可信节点，取最近的非可信来源；格式错误、重复头或缺失真实 IP 的可信代理请求返回 HTTP 429。未配置白名单时，头信息会被忽略，不能为了绕过来源限制而信任任意客户端转发头。
 
-未完成 HTTP 握手的连接使用独立池，默认最多 128 个，每个直连来源最多 16 个，10 秒超时回收；成功升级的 WebSocket 按真实来源限制连接数，未注册连接仍在 15 秒后回收。来源额度按 IPv4 地址或 IPv6 /64 网段归并，防止切换 IPv6 临时地址绕过限制。消息限速按每条连接独立计算，不会把代理下所有玩家合并。公网边缘仍需配置连接/握手速率限制与云厂商抗 DDoS，应用层限制无法抵御链路带宽被打满。
+未完成 HTTP 握手的连接使用独立池，默认最多 128 个，10 秒超时回收；成功升级的 WebSocket 仍受 `MAX_CONNECTIONS` 全局上限约束，未注册连接仍在 15 秒后回收。默认不启用单来源连接限制；只有显式设置有效的 `MAX_CONNECTIONS_PER_SOURCE` 才按真实来源限制连接数，来源额度按 IPv4 地址或 IPv6 /64 网段归并。消息限速按每条连接独立计算，不会把代理下所有玩家合并。公网边缘仍需配置连接/握手速率限制与云厂商抗 DDoS，应用层限制无法抵御链路带宽被打满。
+
+如果部署环境已经正确恢复真实客户端 IP，可以显式设置 `MAX_CONNECTIONS_PER_SOURCE`；如果多个用户经过同一 EdgeOne/OpenResty/Docker 网关而无法恢复真实地址，应保持该变量为空，让 `MAX_CONNECTIONS` 继续提供全局保护，同时修正代理信任链。不要仅为消除 429 而信任任意转发头或关闭全部连接保护。
 
 如果客户端提示无法完成注册，且握手返回 `429 source connection capacity reached`，表示来源连接名额已满，不代表 DNS 解析失败。新版日志会显示 `tcp_peer`、`quota_source`、`trusted_proxy` 和拒绝原因（最多每 5 秒一条）。若不同玩家都被计入同一代理地址，必须修正 `TRUSTED_PROXIES`；若经过 CDN，多层代理也须正确传递和验证真实来源，不能只把 Docker 网关列入白名单而继续按 CDN 节点计数。不要信任任意客户端传来的转发头，也不要为消除报错直接关闭全部连接保护。
 
@@ -156,7 +158,7 @@ docker exec mctier-signaling sh -c 'printenv | grep -E "^(TRUSTED_PROXIES|MAX_CO
 docker logs --tail=300 mctier-signaling 2>&1 | grep -E '拒绝 WebSocket 握手|WebSocket 连接已建立'
 ```
 
-仅修改 `.env` 后，应执行 `docker compose up -d --force-recreate mctier-signaling`，普通重启不会加载新环境变量。代理 IP 必须来自实际部署信息，不能照抄示例。修改源码后仍需按下文重新构建镜像。
+仅修改 `.env` 后，应执行 `docker compose up -d --force-recreate mctier-signaling`，普通重启不会加载新环境变量。代理 IP 必须来自实际部署信息，不能照抄示例。修改源码后仍需重新构建镜像。
 
 源码和环境配置更新后执行：
 

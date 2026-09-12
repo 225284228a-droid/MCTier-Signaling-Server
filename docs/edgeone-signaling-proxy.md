@@ -2,7 +2,7 @@
 
 ## 已确认的故障模式
 
-链路为玩家 -> EdgeOne -> OpenResty -> Docker 信令容器。若 `TRUSTED_PROXIES` 为空，服务端忽略转发头，所有经同一 Docker 网关进入的玩家共享 `MAX_CONNECTIONS_PER_SOURCE`（默认 128）。满额时返回 HTTP 429，响应体为 `source connection capacity reached`。浏览器 WebSocket 接口不提供该 HTTP 状态和响应体，因此旧客户端只显示“无法完成信令服务器注册”。重启客户端不能修正服务端计数方式。
+链路为玩家 -> EdgeOne -> OpenResty -> Docker 信令容器。若 `TRUSTED_PROXIES` 为空，服务端忽略转发头；默认不启用 `MAX_CONNECTIONS_PER_SOURCE`，因此经同一 Docker 网关进入的玩家只共享 `MAX_CONNECTIONS` 全局额度。只有显式设置有效的来源上限时，错误合并来源才会返回 HTTP 429 `source connection capacity reached`。浏览器 WebSocket 接口不提供该 HTTP 状态和响应体，因此旧客户端只显示“无法完成信令服务器注册”。重启客户端不能修正服务端计数方式。
 
 仅把 Docker 网关加入可信代理也不一定足够：未配置真实 IP 恢复的 OpenResty 会把 EdgeOne 节点追加到 `X-Forwarded-For` 末尾，服务端仍可能按 CDN 节点合并玩家。
 

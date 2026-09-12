@@ -2322,6 +2322,10 @@ async fn main() {
     log::info!("最大并发连接数: {}", max_connections);
     let admission = connection_guard::admission();
     log::info!("Trusted reverse proxies: {:?}", admission.trusted_proxies);
+    match admission.source_limit() {
+        Some(limit) => log::info!("单来源并发连接上限: {}", limit),
+        None => log::info!("单来源并发连接上限: 未启用"),
+    }
 
     // 创建大厅列表和客户端映射
     let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
@@ -5366,7 +5370,7 @@ mod tests {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let policy = Arc::new(connection_guard::Admission::new(16, 2, "127.0.0.1").unwrap());
+        let policy = Arc::new(connection_guard::Admission::new(16, Some(2), "127.0.0.1").unwrap());
         let lobbies: Lobbies = Arc::new(RwLock::new(HashMap::new()));
         let clients: ClientLobbyMap = Arc::new(RwLock::new(HashMap::new()));
         let nodes: CommunityNodes = Arc::new(RwLock::new(HashMap::new()));

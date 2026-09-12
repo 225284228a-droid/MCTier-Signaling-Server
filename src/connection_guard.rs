@@ -29,7 +29,7 @@ pub struct Admission {
 
 struct Pool {
     limit: usize,
-    source_limit: usize,
+    source_limit: Option<usize>,
     counts: Mutex<(usize, HashMap<IpAddr, usize>)>,
 }
 
@@ -44,16 +44,20 @@ impl Pool {
         if counts.0 >= self.limit {
             return Err("connection capacity reached");
         }
-        if let Some(ip) = source {
-            if counts.1.get(&ip).copied().unwrap_or(0) >= self.source_limit {
-                return Err("source connection capacity reached");
+        let counted_source = match (source, self.source_limit) {
+            (Some(ip), Some(limit)) => {
+                if counts.1.get(&ip).copied().unwrap_or(0) >= limit {
+                    return Err("source connection capacity reached");
+                }
+                *counts.1.entry(ip).or_default() += 1;
+                Some(ip)
             }
-            *counts.1.entry(ip).or_default() += 1;
-        }
+            _ => None,
+        };
         counts.0 += 1;
         Ok(Lease {
             pool: Arc::clone(self),
-            source,
+            source: counted_source,
         })
     }
 }
@@ -74,7 +78,7 @@ impl Drop for Lease {
 }
 
 impl Admission {
-    pub fn new(max: usize, per_source: usize, proxies: &str) -> Result<Self, String> {
+    pub fn new(max: usize, per_source: Option<usize>, proxies: &str) -> Result<Self, String> {
         let trusted_proxies = proxies
             .split(',')
             .filter(|s| !s.trim().is_empty())
@@ -94,9 +98,19 @@ impl Admission {
         Ok(Self {
             trusted_proxies,
             // Handshakes cannot consume the established WebSocket pool.
-            pending: pool(max.min(128).max(1), per_source.min(16).max(1)),
-            active: pool(max.max(1), per_source.max(1).min(max.saturating_sub(1).max(1))),
+            pending: pool(
+                max.min(128).max(1),
+                per_source.map(|limit| limit.min(16).max(1)),
+            ),
+            active: pool(
+                max.max(1),
+                per_source.map(|limit| limit.max(1).min(max.saturating_sub(1).max(1))),
+            ),
         })
+    }
+
+    pub fn source_limit(&self) -> Option<usize> {
+        self.active.source_limit
     }
 
     pub fn pending(&self, peer: IpAddr) -> Result<Lease, &'static str> {
@@ -152,15 +166,18 @@ impl Admission {
     }
 }
 
+fn source_limit_from_env(value: Option<&str>) -> Option<usize> {
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+}
+
 pub fn admission() -> &'static Admission {
     static VALUE: OnceLock<Admission> = OnceLock::new();
     VALUE.get_or_init(|| {
         let max = super::max_connections();
-        let limit = std::env::var("MAX_CONNECTIONS_PER_SOURCE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(128.min((max / 4).max(1)));
+        let limit =
+            source_limit_from_env(std::env::var("MAX_CONNECTIONS_PER_SOURCE").ok().as_deref());
         Admission::new(
             max,
             limit,
@@ -176,7 +193,7 @@ mod tests {
 
     #[test]
     fn untrusted_headers_cannot_spoof_source_and_trusted_chains_use_nearest_client() {
-        let guard = Admission::new(16, 4, "127.0.0.1,::1").unwrap();
+        let guard = Admission::new(16, Some(4), "127.0.0.1,::1").unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
@@ -206,23 +223,73 @@ mod tests {
     }
 
     #[test]
-    fn one_source_cannot_fill_pool_and_leases_recover_on_disconnect() {
-        let guard = Admission::new(16, 4, "").unwrap();
+    fn disabled_source_limit_allows_one_source_up_to_global_limit() {
+        let guard = Admission::new(4, None, "").unwrap();
         let ip = "192.0.2.1".parse().unwrap();
         let held: Vec<_> = (0..4).map(|_| guard.active(ip).unwrap()).collect();
-        assert!(guard.active(ip).is_err());
+
+        assert!(matches!(
+            guard.active(ip),
+            Err("connection capacity reached")
+        ));
+        drop(held);
+        assert!(guard.active(ip).is_ok());
+
+        let pending: Vec<_> = (0..4).map(|_| guard.pending(ip).unwrap()).collect();
+        assert!(matches!(
+            guard.pending(ip),
+            Err("connection capacity reached")
+        ));
+        drop(pending);
+        assert!(guard.pending(ip).is_ok());
+    }
+
+    #[test]
+    fn explicit_source_limit_rejects_third_connection_and_recovers() {
+        let guard = Admission::new(16, Some(2), "").unwrap();
+        let ip = "192.0.2.1".parse().unwrap();
+        let held: Vec<_> = (0..2).map(|_| guard.active(ip).unwrap()).collect();
+        assert!(matches!(
+            guard.active(ip),
+            Err("source connection capacity reached")
+        ));
         assert!(guard.active("192.0.2.2".parse().unwrap()).is_ok());
         assert!(guard.active("::ffff:192.0.2.1".parse().unwrap()).is_err());
         drop(held);
         assert!(guard.active(ip).is_ok());
-        let pending: Vec<_> = (0..4).map(|_| guard.pending(ip).unwrap()).collect();
+        let pending: Vec<_> = (0..2).map(|_| guard.pending(ip).unwrap()).collect();
         assert!(guard.pending(ip).is_err());
         assert!(guard.active(ip).is_ok());
         drop(pending);
         assert!(guard.pending(ip).is_ok());
         let ipv6 = "2001:db8:1:2::1".parse().unwrap();
-        let _v6: Vec<_> = (0..4).map(|_| guard.active(ipv6).unwrap()).collect();
+        let _v6: Vec<_> = (0..2).map(|_| guard.active(ipv6).unwrap()).collect();
         assert!(guard.active("2001:db8:1:2::ffff".parse().unwrap()).is_err());
         assert!(guard.active("2001:db8:1:3::1".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn different_sources_share_global_limit_and_disconnect_restores_capacity() {
+        let guard = Admission::new(3, None, "").unwrap();
+        let first = guard.active("192.0.2.1".parse().unwrap()).unwrap();
+        let _second = guard.active("192.0.2.2".parse().unwrap()).unwrap();
+        let _third = guard.active("192.0.2.3".parse().unwrap()).unwrap();
+
+        assert!(matches!(
+            guard.active("192.0.2.4".parse().unwrap()),
+            Err("connection capacity reached")
+        ));
+        drop(first);
+        assert!(guard.active("192.0.2.4".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn source_limit_is_disabled_for_missing_empty_zero_and_invalid_values() {
+        assert_eq!(source_limit_from_env(None), None);
+        assert_eq!(source_limit_from_env(Some("")), None);
+        assert_eq!(source_limit_from_env(Some("   ")), None);
+        assert_eq!(source_limit_from_env(Some("0")), None);
+        assert_eq!(source_limit_from_env(Some("not-a-number")), None);
+        assert_eq!(source_limit_from_env(Some(" 128 ")), Some(128));
     }
 }
