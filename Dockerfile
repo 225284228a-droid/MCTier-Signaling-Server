@@ -29,6 +29,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # 创建非 root 用户
