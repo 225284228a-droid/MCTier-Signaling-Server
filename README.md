@@ -145,6 +145,19 @@ mctier.example.com {
 
 未完成 HTTP 握手的连接使用独立池，默认最多 128 个，每个直连来源最多 16 个，10 秒超时回收；成功升级的 WebSocket 按真实来源限制连接数，未注册连接仍在 15 秒后回收。来源额度按 IPv4 地址或 IPv6 /64 网段归并，防止切换 IPv6 临时地址绕过限制。消息限速按每条连接独立计算，不会把代理下所有玩家合并。公网边缘仍需配置连接/握手速率限制与云厂商抗 DDoS，应用层限制无法抵御链路带宽被打满。
 
+如果客户端提示无法完成注册，且握手返回 `429 source connection capacity reached`，表示来源连接名额已满，不代表 DNS 解析失败。新版日志会显示 `tcp_peer`、`quota_source`、`trusted_proxy` 和拒绝原因（最多每 5 秒一条）。若不同玩家都被计入同一代理地址，必须修正 `TRUSTED_PROXIES`；若经过 CDN，多层代理也须正确传递和验证真实来源，不能只把 Docker 网关列入白名单而继续按 CDN 节点计数。不要信任任意客户端传来的转发头，也不要为消除报错直接关闭全部连接保护。
+
+使用腾讯 EdgeOne 与 1Panel/OpenResty 的部署，请按 [EdgeOne 真实来源与注册失败排查](docs/edgeone-signaling-proxy.md) 配置两层代理。连接成功日志中的 `quota_source` 应为玩家出口 IP（IPv6 为 /64 网段），用于确认配置是否真正生效。
+
+可先检查当前容器配置：
+
+```bash
+docker exec mctier-signaling sh -c 'printenv | grep -E "^(TRUSTED_PROXIES|MAX_CONNECTIONS|MAX_CONNECTIONS_PER_SOURCE)="'
+docker logs --tail=300 mctier-signaling 2>&1 | grep -E '拒绝 WebSocket 握手|WebSocket 连接已建立'
+```
+
+仅修改 `.env` 后，应执行 `docker compose up -d --force-recreate mctier-signaling`，普通重启不会加载新环境变量。代理 IP 必须来自实际部署信息，不能照抄示例。修改源码后仍需按下文重新构建镜像。
+
 源码和环境配置更新后执行：
 
 ```bash

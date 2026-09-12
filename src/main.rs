@@ -2487,15 +2487,32 @@ async fn handle_connection_with_timeouts_and_limits(
         handshake_timeout,
         tokio_tungstenite::accept_hdr_async_with_config(stream, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
             let result = admission.source(addr.ip(), request.headers()).and_then(|ip| {
-                let lease = admission.active(ip)?;
                 source_ip = ip;
+                let lease = admission.active(ip)?;
                 active_lease = Some(lease);
                 Ok(())
             });
             match result {
                 Ok(()) => Ok(response),
-                Err(reason) => Err(tokio_tungstenite::tungstenite::http::Response::builder()
-                    .status(429).body(Some(reason.to_owned())).unwrap()),
+                Err(reason) => {
+                    // Throttle diagnostics during floods; never log request headers
+                    // or lobby credentials. Preserve the rejected quota source.
+                    static LAST_REJECTION_LOG: AtomicU64 = AtomicU64::new(0);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let last = LAST_REJECTION_LOG.load(Ordering::Relaxed);
+                    if now.saturating_sub(last) >= 5 && LAST_REJECTION_LOG.compare_exchange(
+                        last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+                    {
+                        log::warn!("拒绝 WebSocket 握手: tcp_peer={} quota_source={} trusted_proxy={} forwarded_header={} reason={}; 反代部署请核对 TRUSTED_PROXIES 与真实来源转发配置",
+                            addr.ip(), connection_guard::quota_source(source_ip),
+                            admission.trusted_proxies.contains(&addr.ip()),
+                            request.headers().contains_key("x-forwarded-for") || request.headers().contains_key("x-real-ip"), reason);
+                    }
+                    Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                        .status(429).header("Retry-After", "5")
+                        .body(Some(reason.to_owned())).unwrap())
+                },
             }
         }, Some(websocket_config())),
     )
@@ -2515,7 +2532,11 @@ async fn handle_connection_with_timeouts_and_limits(
     let _active_lease = active_lease;
     let source_addr = SocketAddr::new(source_ip, addr.port());
 
-    log::info!("✅ WebSocket 连接已建立: {}", addr);
+    log::info!(
+        "✅ WebSocket 连接已建立: {} quota_source={}",
+        addr,
+        connection_guard::quota_source(source_ip)
+    );
 
     let (write, mut read) = ws_stream.split();
     let write = Arc::new(ClientSenderState {
@@ -5370,7 +5391,15 @@ mod tests {
         };
         let (mut a, _) = connect_async(request("192.0.2.1")).await.unwrap();
         let (_a2, _) = connect_async(request("192.0.2.1")).await.unwrap();
-        assert!(connect_async(request("192.0.2.1")).await.is_err());
+        let rejected = connect_async(request("192.0.2.1")).await.unwrap_err();
+        match rejected {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status().as_u16(), 429);
+                assert_eq!(response.headers()["Retry-After"], "5");
+                assert_eq!(response.body().as_deref(), Some(b"source connection capacity reached".as_slice()));
+            }
+            other => panic!("expected an explicit quota rejection, got {other}"),
+        }
         let (mut b, _) = connect_async(request("192.0.2.2")).await.unwrap();
         assert!(connect_async(format!("ws://{address}")).await.is_err(), "missing forwarded identity must not share the proxy IP");
         let submit = Message::Text(serde_json::json!({"type":"community-node-submit", "name":"test", "address":"tcp://127.0.0.1:9"}).to_string());
