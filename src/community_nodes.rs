@@ -1,5 +1,7 @@
 //! Community node submission, persistence, and reachability sweeping.
 use super::*;
+#[cfg(not(test))]
+use crate::state::*;
 
 // ==================== 用户投稿的共享节点 ====================
 

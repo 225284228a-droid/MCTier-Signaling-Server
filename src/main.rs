@@ -137,6 +137,16 @@ fn now_unix_secs() -> u64 {
 mod protocol;
 use protocol::*;
 
+mod security;
+#[cfg(test)]
+use security::*;
+
+mod state;
+use state::*;
+
+mod config;
+use config::*;
+
 mod community_nodes;
 use community_nodes::*;
 mod connection;

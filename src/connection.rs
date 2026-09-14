@@ -1,5 +1,7 @@
 //! WebSocket connection lifecycle, authenticated routing, and lobby state transitions.
 use super::*;
+#[cfg(not(test))]
+use crate::{protocol::*, security::*, state::*};
 
 pub(crate) async fn send_with_timeout<F, E>(send: F) -> bool
 where
