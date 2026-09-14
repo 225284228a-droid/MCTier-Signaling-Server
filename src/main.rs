@@ -2566,12 +2566,16 @@ async fn handle_connection_with_timeouts_and_limits(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut active_lease = None;
     let mut source_ip = addr.ip();
+    let mut pending = pending;
     // 升级到 WebSocket
     let ws_stream = match tokio::time::timeout(
         handshake_timeout,
         tokio_tungstenite::accept_hdr_async_with_config(stream, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
             let result = admission.source(addr.ip(), request.headers()).and_then(|ip| {
                 source_ip = ip;
+                if let Some(pending) = pending.as_mut() {
+                    pending.resolve_source(ip)?;
+                }
                 let lease = admission.active(ip)?;
                 active_lease = Some(lease);
                 Ok(())
